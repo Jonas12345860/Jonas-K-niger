@@ -1,0 +1,215 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <U8g2lib.h>
+#include <SPIFFS.h>
+#include <WiFiUdp.h>
+#include <NTPClient.h>
+
+//-------------------- Netzwerk-Einstellungen --------------------
+const char* wlanSSID = " ";         // Dein WLAN-SSID
+const char* wlanPasswort = " ";     // Dein WLAN-Passwort
+const char* apiEndpoint = "https://api.metalpriceapi.com/v1/latest?apikey=";
+const char* apiKey = " ";           // Dein API-Schlüssel
+
+//-------------------- OLED-Display-Konfiguration --------------------
+#define OLED_BREITE 128  
+#define OLED_HOEHE 64  
+
+U8G2_SSD1306_128X64_NONAME_F_SW_I2C u8g2(U8G2_R0, /* clock=*/ 10, /* data=*/ 8, /* reset=*/ U8X8_PIN_NONE);
+
+//-------------------- Globale Variablen --------------------
+float silberPreis = 0.0;                  // Aktueller Silberpreis (EUR/Gramm)
+String letzteAktualisierung = "N/A";     // Zeitpunkt der letzten Preisaktualisierung
+WiFiUDP udpClient;
+NTPClient zeitClient(udpClient, "pool.ntp.org", 3600, 60000); // UTC+1
+
+// Timing-Variablen
+unsigned long letzteAnzeigeUmschaltung = 0;
+bool preisAnzeigen = true; // Umschalten zwischen Preis- und Update-Anzeige
+
+void setup() {
+  Serial.begin(115200);
+  u8g2.begin();
+
+  // Lokalen Speicher initialisieren
+  if (!SPIFFS.begin(true)) {
+    Serial.println("Fehler beim Initialisieren von SPIFFS.");
+    u8g2Fehlermeldung("Speicherfehler");
+    while (true);
+  }
+
+  // WLAN verbinden
+  wlanVerbinden();
+
+  // NTP-Client starten
+  zeitClient.begin();
+  zeitClient.update();
+
+  // Gespeicherten Silberpreis laden
+  ladeSilberpreis();
+
+  // Task für regelmäßiges Abrufen des Silberpreises erstellen
+  xTaskCreate(
+    aktualisiereSilberPreis, 
+    "Silberpreis Task",
+    4096, 
+    NULL, 
+    1, 
+    NULL
+  );
+}
+
+void loop() {
+  unsigned long aktuelleZeit = millis();
+
+  // Umschalten zwischen Preis- und Update-Anzeige alle 10 Sekunden
+  if (aktuelleZeit - letzteAnzeigeUmschaltung >= 10000) {
+    letzteAnzeigeUmschaltung = aktuelleZeit;
+
+    if (preisAnzeigen) {
+      zeigeSilberPreis();
+    } else {
+      zeigeLetzteAktualisierung();
+    }
+
+    preisAnzeigen = !preisAnzeigen;
+  }
+}
+
+//-------------------- Funktionen --------------------
+
+// Verbinde mit WLAN
+void wlanVerbinden() {
+  WiFi.begin(wlanSSID, wlanPasswort);
+  Serial.print("Verbinde mit WLAN");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println(" Verbunden!");
+}
+
+// Aktualisiere den Silberpreis
+void aktualisiereSilberPreis(void* parameter) {
+  while (true) {
+    if (WiFi.status() == WL_CONNECTED) {
+      holeSilberPreis();
+    } else {
+      wlanVerbinden();
+    }
+
+    // Warte 8 Stunden bis zur nächsten Aktualisierung
+    vTaskDelay(8 * 60 * 60 * 1000 / portTICK_PERIOD_MS);
+  }
+}
+
+// Hole den aktuellen Silberpreis
+void holeSilberPreis() {
+  HTTPClient httpClient;
+  String apiUrl = String(apiEndpoint) + apiKey;
+  int versuche = 0;
+  int maxVersuche = 3;
+
+  while (versuche < maxVersuche) {
+    httpClient.begin(apiUrl);
+    int httpCode = httpClient.GET();
+
+    if (httpCode == 200) {
+      String payload = httpClient.getString();
+      StaticJsonDocument<1024> json;
+      DeserializationError fehler = deserializeJson(json, payload);
+
+      if (!fehler) {
+        float xagKurs = json["rates"]["XAG"];
+        float eurKurs = json["rates"]["EUR"];
+
+        // Silberpreis in EUR/Gramm berechnen
+        float silberInUSD = 1.0 / xagKurs;
+        silberPreis = (silberInUSD / 31.1035) * eurKurs;
+
+        // Zeit aktualisieren
+        zeitClient.update();
+        letzteAktualisierung = zeitClient.getFormattedTime();
+
+        // Silberpreis speichern
+        speichereSilberpreis();
+        Serial.println("Silberpreis erfolgreich aktualisiert.");
+        httpClient.end();
+        return;
+      } else {
+        Serial.println("JSON-Fehler.");
+        u8g2Fehlermeldung("JSON Fehler");
+      }
+    } else {
+      Serial.printf("HTTP-Fehler: %d\n", httpCode);
+      u8g2Fehlermeldung("HTTP Fehler");
+    }
+
+    httpClient.end();
+    versuche++;
+    vTaskDelay(2000 / portTICK_PERIOD_MS);
+  }
+
+  ladeSilberpreis();
+}
+
+// Zeige den Silberpreis auf dem OLED an
+void zeigeSilberPreis() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x12_tf);
+  u8g2.setCursor(10, 25);
+  u8g2.print("Silber:");
+  u8g2.setCursor(10, 40);
+  u8g2.print(silberPreis, 2);
+  u8g2.print(" EUR/Gram");
+  u8g2.sendBuffer();
+}
+
+// Zeige die letzte Aktualisierungszeit auf dem OLED an
+void zeigeLetzteAktualisierung() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x12_tf);
+  u8g2.setCursor(10, 25);
+  u8g2.print("Letzte Aktual:");
+  u8g2.setCursor(10, 40);
+  u8g2.print(letzteAktualisierung);
+  u8g2.sendBuffer();
+}
+
+// Zeige eine Fehlermeldung auf dem OLED an
+void u8g2Fehlermeldung(const char* meldung) {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x12_tf);
+  u8g2.setCursor(10, 25);
+  u8g2.print("Fehler:");
+  u8g2.setCursor(10, 40);
+  u8g2.print(meldung);
+  u8g2.sendBuffer();
+}
+
+// Silberpreis im SPIFFS speichern
+void speichereSilberpreis() {
+  File datei = SPIFFS.open("/silberpreis.txt", FILE_WRITE);
+  if (!datei) {
+    Serial.println("Fehler beim Speichern.");
+    u8g2Fehlermeldung("Speicherfehler");
+    return;
+  }
+  datei.println(silberPreis);
+  datei.close();
+}
+
+// Silberpreis aus SPIFFS laden
+void ladeSilberpreis() {
+  File datei = SPIFFS.open("/silberpreis.txt", FILE_READ);
+  if (!datei) {
+    Serial.println("Keine gespeicherten Daten gefunden.");
+    return;
+  }
+  String gespeicherterWert = datei.readString();
+  silberPreis = gespeicherterWert.toFloat();
+  datei.close();
+  Serial.println("Gespeicherter Silberpreis geladen.");
+}
